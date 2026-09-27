@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { analyze } from './analyze';
 import { generateFullScale } from './sampleGenerator';
 import { MAX_FILE_BYTES, formatByteSize } from './types';
@@ -20,12 +20,18 @@ type ViewState =
 /**
  * 第 k 小复核台。关键不变量：
  * - 每次重新选文件/载入样本都先清空旧视图，再处理新内容；
+ * - 异步读取按单调递增序号兜底：无论各次读取以什么顺序结束，
+ *   晚到的旧读取一律丢弃，视图只属于最后选择的卷；
  * - 只有全部校验通过才渲染答案，任何非法文件只显示错误、绝不留下部分答案；
  * - 答案按 queries 原顺序一一对应展示，显式打印查询下标，杜绝相邻窗口错位。
  */
 export function KthReview() {
   const [view, setView] = useState<ViewState>({ status: 'idle' });
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // 单调递增的载入序号：每次开始载入（选文件/载样本）都 +1，
+  // 异步读取结束后若序号已过期，说明有更新的选择，丢弃旧结果，
+  // 保证视图永远属于质检员最后选择的卷。
+  const loadSeqRef = useRef(0);
 
   const consumeObject = useCallback((obj: unknown, fileName: string) => {
     // analyze 内部保证：失败时 answers 为空，调用方据此清除旧结果
@@ -48,6 +54,7 @@ export function KthReview() {
 
   const handleFile = useCallback(
     async (file: File) => {
+      const seq = ++loadSeqRef.current;
       // 先清除旧结果（含上一份成功答案），再进入新文件处理
       setView({ status: 'busy', fileName: file.name });
       // 读取前规模闸门：超限文件不读入内存，诊断有界
@@ -63,6 +70,8 @@ export function KthReview() {
       }
       try {
         const text = await file.text();
+        // 读取期间质检员可能已选择更新的文件：旧读取无论成败都不得覆盖新视图
+        if (seq !== loadSeqRef.current) return;
         let parsed: unknown;
         try {
           parsed = JSON.parse(text);
@@ -77,6 +86,7 @@ export function KthReview() {
         }
         consumeObject(parsed, file.name);
       } catch (e) {
+        if (seq !== loadSeqRef.current) return;
         const msg = e instanceof Error ? e.message : String(e);
         setView({ status: 'error', fileName: file.name, errors: [`文件读取失败：${msg}`] });
       }
@@ -95,9 +105,12 @@ export function KthReview() {
   );
 
   const loadFullScaleSample = useCallback(() => {
+    const seq = ++loadSeqRef.current;
     setView({ status: 'busy', fileName: '内置满规模样本（200000 读数 / 100000 查询）' });
     // 让 busy 有机会绘制后再做重计算
     setTimeout(() => {
+      // 等待期间若已选择文件，样本不得覆盖更新的视图
+      if (seq !== loadSeqRef.current) return;
       const sample = generateFullScale();
       consumeObject(sample, '内置满规模样本（200000 读数 / 100000 查询）');
     }, 16);
@@ -187,8 +200,21 @@ function VirtualTable({ queries, answers }: { queries: Query[]; answers: number[
   const scrollRef = useRef<HTMLDivElement>(null);
   const [scrollTop, setScrollTop] = useState(0);
 
+  // 换卷时旧滚动位置可能超出新查询总数（末页浏览后尤其如此），
+  // 导致 startIndex 越过末行、视口没有任何可见行；
+  // 每次载入新查询集都回到首行，保证当前卷的首末查询都能核对。
+  useEffect(() => {
+    setScrollTop(0);
+    const el = scrollRef.current;
+    if (el) el.scrollTop = 0;
+  }, [queries]);
+
   const total = queries.length;
-  const startIndex = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
+  // 防御性钳制：即使 scrollTop 暂时仍是旧值，也不让起始下标越过末行
+  const startIndex = Math.min(
+    Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN),
+    Math.max(0, total - 1),
+  );
   const visibleCount = Math.ceil(VIEWPORT_HEIGHT / ROW_HEIGHT) + OVERSCAN * 2;
   const endIndex = Math.min(total, startIndex + visibleCount);
 
